@@ -10,3 +10,5 @@ overarching goals of this project are to:
    engineering analysis and multiphysics simulation.
 4. Develop data-driven rationale for the use of OpenMC in fusion licensing
    applications
+
+## 📊 [Project Board](https://github.com/orgs/openmc-dev/projects/3)

@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from math import pi
 
@@ -8,12 +9,17 @@ import numpy as np
 
 
 def run_openmc_simulation():
-    """Run OpenMC simulation and extract neutron flux"""
+    """Run OpenMC simulation and extract neutron flux.
+
+    Extended to support multi-nuclide materials (e.g., natural Fe).
+    Returns the OpenMC model so we can query the nuclides present.
+    """
     print("Running OpenMC simulation...")
 
-    # Create Fe56 material
+    # Create natural Fe material (multi-nuclide)
     mat = openmc.Material()
-    mat.add_nuclide('Fe56', 1.0)
+    # First example: natural Fe (user request)
+    mat.add_element('Fe', 1.0)
     mat.set_density('g/cm3', 7.874)
 
     # Create spherical geometry
@@ -49,7 +55,7 @@ def run_openmc_simulation():
     flux /= cell.volume  # Convert to flux per unit volume
     energies = energy_filter.values  # Energy bin boundaries in eV
 
-    return flux, energies
+    return flux, energies, model
 
 
 def create_spectra_pka_flux_file(flux, energies, filename="openmc_flux.dat"):
@@ -64,7 +70,7 @@ def create_spectra_pka_flux_file(flux, energies, filename="openmc_flux.dat"):
 
     with open(filename, 'w') as f:
         # Header line (description)
-        f.write("OpenMC-generated neutron flux for Fe56 target\n")
+        f.write("OpenMC-generated neutron flux for target material\n")
 
         # Control line: itype=2, dummy=0, igroup=2 (n/s/cm2), dummy=0, acnm=1.0, time=1.0
         f.write("2 0 2 0 1.0 1.0\n")
@@ -84,27 +90,109 @@ def create_spectra_pka_flux_file(flux, energies, filename="openmc_flux.dat"):
     return filename
 
 
-def create_spectra_pka_input_file(flux_filename, results_stub="Fe56_OpenMC"):
-    """Create SPECTRA-PKA input file for Fe56"""
+def _parse_nuclide_name(nuc: str):
+    """Parse a nuclide string like 'Fe56' -> ('Fe', 56)."""
+    i = 0
+    while i < len(nuc) and not nuc[i].isdigit():
+        i += 1
+    symbol = nuc[:i]
+    mass_str = nuc[i:]
+    try:
+        A = int(mass_str)
+    except ValueError:
+        A = None
+    return symbol, A
+
+
+def _pka_filepath_for_nuclide(nuc: str, base_dir: str) -> str:
+    """Build the SPECTRA-PKA file path for a nuclide name like 'Fe56'."""
+    sym, A = _parse_nuclide_name(nuc)
+    if sym and A:
+        return os.path.join(base_dir, f"{sym}{A:03d}s.asc")
+    return ""
+
+
+def _atomic_mass_amu(nuc: str) -> float:
+    """Best-effort atomic mass (amu) for a nuclide string like 'Fe56'.
+    Tries openmc.data.atomic_mass, else falls back to mass number.
+    """
+    try:
+        from openmc.data import atomic_mass
+        return float(atomic_mass(nuc))
+    except Exception:
+        # Fallback to mass number if available
+        _, A = _parse_nuclide_name(nuc)
+        return float(A) if A else 0.0
+
+
+def create_spectra_pka_input_file(
+    flux_filename,
+    results_stub="Fe_OpenMC",
+    model: openmc.Model | None = None,
+    pka_base_dir: str = "/opt/data/spectra-pka/tendl2019/pka",
+):
+    """Create SPECTRA-PKA input file.
+
+    - Uses the provided OpenMC model to find all nuclides present in geometry.
+    - Writes one pka_filename row per nuclide using TENDL2019 SPECTRA-PKA data.
+    """
     input_filename = f"{results_stub}.in"
     print(f"Creating SPECTRA-PKA input file: {input_filename}")
 
-    # Path to Fe56 PKA data file
-    pka_data_file = "SPECTRA-PKA/manual/usergrid_test/Fe056s.asc"
+    # Collect nuclides present in the model geometry
+    nuclides = []
+    if model is not None and model.geometry is not None:
+        try:
+            # Can return dict-like of nuclides; normalize to strings
+            found = model.geometry.get_all_nuclides()
+            # found may be dict of {Nuclide/str: float}; take the keys
+            for k in (found.keys() if hasattr(found, 'keys') else list(found)):
+                name = getattr(k, 'name', None) or (str(k) if not isinstance(k, str) else k)
+                nuclides.append(name)
+        except Exception:
+            pass
+
+    # Fallback: if we couldn't query, assume Fe natural set
+    if not nuclides:
+        nuclides = ["Fe054", "Fe056", "Fe057", "Fe058"]  # strings may not match 'Fe56'
+        # Normalize to standard 'Fe54' etc
+        nuclides = [f"Fe{int(n[2:]):d}" if n.startswith("Fe") else n for n in nuclides]
+
+    # Build rows for nuclides with available PKA files
+    pka_rows = []
+    for nuc in sorted(set(nuclides)):
+        # Ensure format like 'Fe56'
+        sym, A = _parse_nuclide_name(nuc)
+        if not sym or not A:
+            continue
+        pka_file = _pka_filepath_for_nuclide(nuc, pka_base_dir)
+        if not os.path.exists(pka_file):
+            print(f"Warning: PKA file not found for {nuc}: {pka_file} (skipping)")
+            continue
+        # Masses for (n,gamma) estimate
+        parent_mass = _atomic_mass_amu(nuc)
+        daughter = f"{sym}{A+1}"
+        daughter_mass = _atomic_mass_amu(daughter)
+        # Parent element symbol and mass number
+        parent_ele = sym
+        parent_num = A
+        pka_rows.append((pka_file, 1.0, parent_ele, parent_num, parent_mass, daughter_mass))
 
     with open(input_filename, 'w') as f:
         f.write(f'flux_filename="{flux_filename}"\n')
         f.write(f'results_stub="{results_stub}"\n')
         f.write('num_columns=6\n')
         f.write('columns= pka_filename pka_ratios parent_ele parent_num ngamma_parent_mass ngamma_daughter_mass\n')
-        f.write(f'"{pka_data_file}" 1.0 Fe 56 55.934936326 56.935392841\n')
+        # One line per nuclide present
+        for (pka_file, ratio, ele, anum, m_parent, m_daughter) in pka_rows:
+            f.write(f'"{pka_file}" {ratio:.1f} {ele} {anum} {m_parent} {m_daughter}\n')
         f.write('flux_norm_type=2\n')
         f.write('pka_filetype=2\n')
         f.write('do_mtd_sums=.true.\n')
         f.write('do_ngamma_estimate=.t.\n')
         f.write('do_global_sums=.t.\n')
         f.write('do_exclude_light_from_total=.t.\n')
-        f.write('number_pka_files=1\n')
+        f.write(f'number_pka_files={len(pka_rows)}\n')
         f.write('energies_once_perfile=.t.\n')
         f.write('do_tdam=.t.\n')
         f.write('assumed_ed=40.0\n')
@@ -117,7 +205,7 @@ def run_spectra_pka(input_filename):
     print(f"Running SPECTRA-PKA with input file: {input_filename}")
 
     # Path to SPECTRA-PKA executable
-    spectra_pka_exe = "SPECTRA-PKA/spectra-pka"
+    spectra_pka_exe = "damage/SPECTRA-PKA/spectra-pka"
 
     try:
         # Run SPECTRA-PKA
@@ -282,18 +370,61 @@ def read_spectra_pka_results(results_stub="Fe56_OpenMC"):
 
 
 def plot_results(flux, flux_energies, all_reactions, key_reactions):
-    """Plot OpenMC flux and SPECTRA-PKA results for all reaction channels"""
+    """Plot OpenMC flux and SPECTRA-PKA results (2x2 layout)."""
     print("Creating plots...")
 
-    plt.figure(figsize=(16, 12))
+    # Small performance tweaks for faster rendering
+    try:
+        import matplotlib as mpl
+        mpl.rcParams['path.simplify'] = True
+        mpl.rcParams['path.simplify_threshold'] = 0.5
+        mpl.rcParams['agg.path.chunksize'] = 10000
+        mpl.rcParams['lines.antialiased'] = False
+    except Exception:
+        pass
 
-    # Create a 2x3 subplot layout
-    ax1 = plt.subplot(2, 3, 1)  # Neutron flux
-    ax2 = plt.subplot(2, 3, 2)  # Key reactions
-    ax3 = plt.subplot(2, 3, 3)  # Total PKA spectrum
-    ax4 = plt.subplot(2, 3, 4)  # Elastic vs inelastic
-    ax5 = plt.subplot(2, 3, 5)  # Nuclear reactions
-    ax6 = plt.subplot(2, 3, 6)  # Reaction contributions
+    def _format_reaction_label(desc: str) -> str:
+        """Format channel description into 'Target(n,xxx)' like 'Fe56(n,gamma)'."""
+        # Find target after 'from [ Fe56 ]' or in 'recoil matrix of Fe56'
+        target = None
+        m = re.search(r"from\s*\[\s*([A-Za-z]{1,2}\d{2,3})\s*\]", desc)
+        if m:
+            target = m.group(1)
+        if not target:
+            m2 = re.search(r"recoil matrix of\s+([A-Za-z]{1,2}\d{0,3})", desc)
+            if m2:
+                target = m2.group(1)
+        # Extract reaction in parentheses containing 'n,' if present
+        rx = re.search(r"\((n,[^)]+)\)", desc)
+        reaction = None
+        if rx:
+            reaction = rx.group(1)
+            # Expand short forms
+            reaction = reaction.replace(',g', ',gamma').replace(',a', ',alpha')
+        elif 'scatter recoil matrix' in desc:
+            reaction = 'n,scatter'
+        elif re.search(r'total\s*\(z,p\)', desc):
+            reaction = 'n,p'
+        elif re.search(r'total\s*\(z,a\)', desc):
+            reaction = 'n,alpha'
+        elif 'estimated (n,g)' in desc:
+            reaction = 'n,gamma'
+        # Handle totals without explicit (z,*) tokens
+        if reaction is None:
+            if re.search(r'\btotal\s+proton\s+matrix\b', desc, re.IGNORECASE) or re.search(r'\bproton\s+matrix\b', desc, re.IGNORECASE):
+                reaction = 'n,p'
+            elif re.search(r'\btotal\s+alpha\s+matrix\b', desc, re.IGNORECASE) or re.search(r'\balpha\s+matrix\b', desc, re.IGNORECASE):
+                reaction = 'n,alpha'
+        # Fallbacks
+        if target and reaction:
+            return f"{target}({reaction})"
+        if target and 'recoil matrix' in desc:
+            return f"{target}(recoil)"
+        return desc
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    ax1, ax2 = axes[0]
+    ax3, ax4 = axes[1]
 
     # Plot 1: OpenMC neutron flux
     ax1.stairs(flux, flux_energies)
@@ -310,37 +441,62 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
              transform=ax1.transAxes, verticalalignment='top',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
-    # Define colors for different reaction types
-    colors = {
-        'elastic': 'blue',
-        'inelastic': 'green',
-        'scatter': 'cyan',
-        'n_2n': 'red',
-        'n_p': 'orange',
-        'n_alpha': 'purple',
-        'n_gamma': 'brown',
-        'total': 'black'
-    }
+    # Colors dict removed; plots use default color cycle for simplicity
 
-    # Plot 2: Key reactions overview
-    if key_reactions:
-        for reaction_type, data in key_reactions.items():
-            if reaction_type != 'total':  # Plot total separately
-                nonzero_mask = data['pka_rates'] > 0
-                if np.any(nonzero_mask):
-                    energies = data['energies'][nonzero_mask]
-                    rates = data['pka_rates'][nonzero_mask]
-                    ax2.loglog(energies, rates, label=reaction_type.replace('_', ','),
-                              color=colors.get(reaction_type, 'gray'), linewidth=2)
+    # Plot 2: Top-10 channels by integrated PKAs/s (standard reactions only)
+    top10 = []
+    if all_reactions is not None:
+        def _is_standard_channel(name: str) -> bool:
+            # Exclude aggregates and totals
+            lname = name.lower()
+            banned = [
+                'input_spectrum',
+                'total recoil matrix (he+h+unknowns excluded)'.lower(),
+                'scatter recoil matrix',
+                'total proton matrix',
+                'total alpha matrix',
+                'recoil matrix of ',
+                'elemental recoil matrix of ',
+                'total (z,p)',
+                'total (z,a)'
+            ]
+            if any(b in lname for b in banned):
+                return False
+            # Include standard (n,*) channels and the (n,gamma) estimate
+            if 'estimated (n,g)' in name:
+                return True
+            return re.search(r"\(n,[^)]+\)", name) is not None
+
+        for idx, data in all_reactions.items():
+            name = data['name']
+            # Only consider standard reaction channels, not aggregates
+            if not _is_standard_channel(name):
+                continue
+            nonzero_mask = data['pka_rates'] > 0
+            if not np.any(nonzero_mask):
+                continue
+            energies = data['energies'][nonzero_mask]
+            rates = data['pka_rates'][nonzero_mask]
+            rate_int = np.trapezoid(rates, energies)
+            top10.append((rate_int, name, energies, rates))
+        top10.sort(reverse=True, key=lambda x: x[0])
+        top10 = top10[:10]
+
+        # Plot them
+        color_cycle = plt.cm.tab10.colors
+        for i, (rate_int, name, energies, rates) in enumerate(top10):
+            label = _format_reaction_label(name)
+            ax2.loglog(energies, rates, label=f"{i+1}. {label}", color=color_cycle[i % len(color_cycle)], linewidth=1.8)
 
         ax2.set_xlabel('PKA Energy [eV]')
         ax2.set_ylabel('PKA Rate [PKAs/s]')
-        ax2.set_title('Key Reaction Channels')
+        ax2.set_title('Top-10 Channels by Integrated PKAs/s')
         ax2.grid(True, alpha=0.3)
-        ax2.legend(fontsize=9)
+        if top10:
+            ax2.legend(fontsize=7)
 
     # Plot 3: Total PKA spectrum
-    if 'total' in key_reactions:
+    if key_reactions is not None and 'total' in key_reactions:
         data = key_reactions['total']
         nonzero_mask = data['pka_rates'] > 0
         if np.any(nonzero_mask):
@@ -370,76 +526,32 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
     ax3.grid(True, alpha=0.3)
     ax3.legend()
 
-    # Plot 4: Elastic vs Inelastic comparison
-    if 'elastic' in key_reactions and 'inelastic' in key_reactions:
-        for reaction_type in ['elastic', 'inelastic']:
-            data = key_reactions[reaction_type]
-            nonzero_mask = data['pka_rates'] > 0
-            if np.any(nonzero_mask):
-                energies = data['energies'][nonzero_mask]
-                rates = data['pka_rates'][nonzero_mask]
-                ax4.loglog(energies, rates, label=reaction_type,
-                          color=colors[reaction_type], linewidth=2)
-
-        ax4.set_xlabel('PKA Energy [eV]')
-        ax4.set_ylabel('PKA Rate [PKAs/s]')
-        ax4.set_title('Elastic vs Inelastic Scattering')
+    # Plot 4: Top-10 contributions bar chart (bottom-right)
+    if top10:
+        names = [_format_reaction_label(name) for _, name, _, _ in top10]
+        rates = [rate for rate, _, _, _ in top10]
+        colors_list = [plt.cm.tab10.colors[i % 10] for i in range(len(top10))]
+        bars = ax4.bar(range(len(names)), rates, color=colors_list)
+        ax4.set_xlabel('Reaction Channel (Top-10)')
+        ax4.set_ylabel('Integrated PKA Rate [PKAs/s]')
+        ax4.set_title('Top-10 Channel Contributions')
+        ax4.set_yscale('log')
+        ax4.set_xticks(range(len(names)))
+        # Truncate long names for readability
+        tick_labels = [n if len(n) <= 22 else (n[:21] + '…') for n in names]
+        ax4.set_xticklabels(tick_labels, rotation=45, ha='right', fontsize=8)
         ax4.grid(True, alpha=0.3)
-        ax4.legend()
 
-    # Plot 5: Nuclear reactions (n,2n), (n,p), (n,α), (n,γ)
-    nuclear_reactions = ['n_2n', 'n_p', 'n_alpha', 'n_gamma']
-    for reaction_type in nuclear_reactions:
-        if reaction_type in key_reactions:
-            data = key_reactions[reaction_type]
-            nonzero_mask = data['pka_rates'] > 0
-            if np.any(nonzero_mask):
-                energies = data['energies'][nonzero_mask]
-                rates = data['pka_rates'][nonzero_mask]
-                ax5.loglog(energies, rates, label=reaction_type.replace('_', ','),
-                          color=colors[reaction_type], linewidth=2)
-
-    ax5.set_xlabel('PKA Energy [eV]')
-    ax5.set_ylabel('PKA Rate [PKAs/s]')
-    ax5.set_title('Nuclear Reactions')
-    ax5.grid(True, alpha=0.3)
-    ax5.legend()
-
-    # Plot 6: Reaction contributions (integrated rates)
-    if key_reactions:
-        reaction_names = []
-        integrated_rates = []
-        colors_list = []
-
-        for reaction_type, data in key_reactions.items():
-            if reaction_type != 'total':
-                nonzero_mask = data['pka_rates'] > 0
-                if np.any(nonzero_mask):
-                    energies = data['energies'][nonzero_mask]
-                    rates = data['pka_rates'][nonzero_mask]
-                    integrated_rate = np.trapezoid(rates, energies)
-                    if integrated_rate > 0:
-                        reaction_names.append(reaction_type.replace('_', ','))
-                        integrated_rates.append(integrated_rate)
-                        colors_list.append(colors.get(reaction_type, 'gray'))
-
-        if reaction_names:
-            bars = ax6.bar(range(len(reaction_names)), integrated_rates, color=colors_list)
-            ax6.set_xlabel('Reaction Channel')
-            ax6.set_ylabel('Integrated PKA Rate [PKAs/s]')
-            ax6.set_title('Reaction Channel Contributions')
-            ax6.set_yscale('log')
-            ax6.set_xticks(range(len(reaction_names)))
-            ax6.set_xticklabels(reaction_names, rotation=45, ha='right')
-            ax6.grid(True, alpha=0.3)
-
-            # Add values on bars
-            for i, (bar, rate) in enumerate(zip(bars, integrated_rates)):
-                ax6.text(bar.get_x() + bar.get_width()/2, bar.get_height()*1.1,
-                        f'{rate:.1e}', ha='center', va='bottom', fontsize=8)
+        # Add values on bars
+        for bar, rate in zip(bars, rates):
+            ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height()*1.05,
+                     f'{rate:.1e}', ha='center', va='bottom', fontsize=8)
 
     plt.tight_layout()
-    plt.savefig('openmc_spectra_pka_results.png', dpi=300, bbox_inches='tight')
+    # Intentionally skip saving to PNG by default to avoid memory blow-ups during compression.
+    # To enable saving, set environment variable SAVE_PNG=1.
+    if os.environ.get('SAVE_PNG', '').lower() in ('1', 'true', 'yes'):
+        plt.savefig('openmc_spectra_pka_results.png', dpi=150)
     plt.show()
 
     # Print detailed summary
@@ -503,14 +615,19 @@ def main():
     print("=" * 60)
 
     # Step 1: Run OpenMC simulation
-    flux, energies = run_openmc_simulation()
+    flux, energies, model = run_openmc_simulation()
 
     # Step 2: Create SPECTRA-PKA flux file
     flux_filename = create_spectra_pka_flux_file(flux, energies)
 
     # Step 3: Create SPECTRA-PKA input file
-    results_stub = "Fe56_OpenMC"
-    input_filename = create_spectra_pka_input_file(flux_filename, results_stub)
+    results_stub = "Fe_OpenMC"
+    input_filename = create_spectra_pka_input_file(
+        flux_filename,
+        results_stub,
+        model=model,
+        pka_base_dir="/opt/data/spectra-pka/tendl2019/pka",
+    )
 
     # Step 4: Run SPECTRA-PKA
     success = run_spectra_pka(input_filename)

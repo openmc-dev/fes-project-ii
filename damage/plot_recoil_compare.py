@@ -77,25 +77,21 @@ def load_json_spectrum(json_path: str, key: str) -> Tuple[np.ndarray, np.ndarray
 
 
 def plot_compare(openmc_E: np.ndarray, openmc_Y: np.ndarray, json_E: np.ndarray, json_Y: np.ndarray,
-                 json_key: str, title_suffix: str = "") -> None:
+                 json_key: str) -> None:
     plt.figure(figsize=(8, 6))
-
-    plt.stairs(openmc_Y, openmc_E, label='OpenMC tally (recoil_distribution)', lw=2)
-    plt.stairs(json_Y, json_E, label=f'SPECTRA-PKA JSON ({json_key})', lw=2)
+    plt.stairs(openmc_Y, openmc_E, label='OpenMC')
+    plt.stairs(json_Y, json_E, label='SPECTRA-PKA')
     plt.xscale('log')
     plt.yscale('log')
     plt.xlabel('Recoil Energy [eV]')
     plt.ylabel('Rate [PKAs/s/cm³]')
-    title = 'Recoil Spectrum Comparison'
-    if title_suffix:
-        title += f' — {title_suffix}'
+    title = f'Recoil Spectrum: {json_key}'
     plt.title(title)
     plt.grid(True, which='both', alpha=0.3)
     plt.legend()
     plt.tight_layout()
     plt.savefig('recoil_spectrum_comparison.png')
     plt.show()
-
 
 
 def main():
@@ -131,8 +127,7 @@ def main():
     E_json, Y_json, found_key = load_json_spectrum(args.json, args.json_key)
 
     # Plot
-    title_suffix = os.path.basename(statepoint)
-    plot_compare(E_openmc, Y_openmc, E_json, Y_json, found_key, title_suffix=title_suffix)
+    plot_compare(E_openmc, Y_openmc, E_json, Y_json, found_key)
 
 
 if __name__ == '__main__':

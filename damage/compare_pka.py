@@ -504,7 +504,7 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
     ax1.grid(True, alpha=0.3)
 
     # Add flux statistics
-    total_flux = np.trapezoid(flux, flux_energies[:-1])
+    total_flux = flux.sum()
     ax1.text(0.02, 0.98, f'Total: {total_flux:.2e} n/cm²/s',
              transform=ax1.transAxes, verticalalignment='top',
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
@@ -629,7 +629,7 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
     print("OpenMC Simulation:")
     print(f"  - Energy groups: {len(flux)}")
     print(f"  - Energy range: {flux_energies[0]:.1e} - {flux_energies[-1]:.1e} eV")
-    print(f"  - Total neutron flux: {np.trapezoid(flux, flux_energies[:-1]):.2e} n/cm²/s")
+    print(f"  - Total neutron flux: {flux.sum():.2e} n/cm²/s")
 
     if all_reactions:
         print("\nSPECTRA-PKA Results:")

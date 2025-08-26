@@ -490,34 +490,6 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
     except Exception:
         pass
 
-    def _format_reaction_label(desc: str) -> str:
-        # Delegate to the shared formatter so labels match JSON keys
-        return format_reaction_label(desc)
-
-    def _stairs_positive(ax, edges_eV, y, **kwargs):
-        """Plot stairs only where y > 0 to keep log scales happy."""
-        y = np.asarray(y)
-        edges_eV = np.asarray(edges_eV)
-        if y.size + 1 != edges_eV.size:
-            # Try to coerce shapes by truncation
-            n = min(y.size, edges_eV.size - 1)
-            y = y[:n]
-            edges_eV = edges_eV[: n + 1]
-        mask = y > 0
-        if not np.any(mask):
-            return
-        idx = np.where(mask)[0]
-        start = idx[0]
-        last = idx[0]
-        for k in idx[1:]:
-            if k == last + 1:
-                last = k
-            else:
-                ax.stairs(y[start:last+1], edges_eV[start:last+2], **kwargs)
-                start = k
-                last = k
-        ax.stairs(y[start:last+1], edges_eV[start:last+2], **kwargs)
-
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     ax1, ax2 = axes[0]
     ax3, ax4 = axes[1]
@@ -580,8 +552,8 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
         # Plot them
         color_cycle = plt.cm.tab10.colors
         for i, (rate_sum, name, edges, rates) in enumerate(top10):
-            label = _format_reaction_label(name)
-            _stairs_positive(ax2, edges, rates, label=f"{i+1}. {label}", color=color_cycle[i % len(color_cycle)], linewidth=1.8)
+            label = format_reaction_label(name)
+            ax2.stairs(rates, edges, label=f"{i+1}. {label}", color=color_cycle[i % len(color_cycle)], linewidth=1.8)
 
         ax2.set_xlabel('PKA Energy [eV]')
         ax2.set_ylabel('PKA Rate [PKAs/s]')
@@ -598,7 +570,7 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
         edges = np.asarray(data['energy_edges_eV'])
         rates = np.asarray(data['pka_rates'])
         if np.any(rates > 0):
-            _stairs_positive(ax3, edges, rates, color='k', linewidth=3, label='Total PKA Rate')
+            ax3.stairs(rates, edges, color='k', linewidth=3, label='Total PKA Rate')
 
             # Add damage threshold
             damage_threshold = 40  # eV
@@ -624,7 +596,7 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
 
     # Plot 4: Top-10 contributions bar chart (bottom-right)
     if top10:
-        names = [_format_reaction_label(name) for _, name, _, _ in top10]
+        names = [format_reaction_label(name) for _, name, _, _ in top10]
         rates = [rate for rate, _, _, _ in top10]
         colors_list = [plt.cm.tab10.colors[i % 10] for i in range(len(top10))]
         bars = ax4.bar(range(len(names)), rates, color=colors_list)

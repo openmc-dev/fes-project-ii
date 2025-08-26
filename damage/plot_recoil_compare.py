@@ -41,7 +41,7 @@ def find_latest_statepoint() -> Optional[str]:
 def load_openmc_recoil_spectrum(statepoint_path: str, tally_name: str, tally_id: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
     """Load recoil spectrum from an OpenMC statepoint tally.
 
-    Returns (energy_centers_eV, values) as 1D arrays.
+    Returns (energies, values) as 1D arrays.
     """
     with openmc.StatePoint(statepoint_path) as sp:
         tally = sp.get_tally(name=tally_name)
@@ -55,24 +55,24 @@ def load_openmc_recoil_spectrum(statepoint_path: str, tally_name: str, tally_id:
 
 
 def load_json_spectrum(json_path: str, key: str) -> Tuple[np.ndarray, np.ndarray, str]:
-    """Load a spectrum from the SPECTRA-PKA JSON. Returns (energies_eV, rates, found_key)."""
+    """Load a spectrum from the SPECTRA-PKA JSON. Returns (energies, rates, found_key)."""
     with open(json_path, 'r') as f:
         data = json.load(f)
     spectra = data.get('spectra', {})
     if key in spectra:
         entry = spectra[key]
-        return np.asarray(entry['energies_eV']), np.asarray(entry['pka_rates']), key
+        return np.asarray(entry['energies']), np.asarray(entry['pka_rates']), key
     # Fallback: find a key that starts with the base (handles '#2' duplicates)
     for k in spectra.keys():
         if k == key or k.startswith(key + '#'):
             entry = spectra[k]
-            return np.asarray(entry['energies_eV']), np.asarray(entry['pka_rates']), k
+            return np.asarray(entry['energies']), np.asarray(entry['pka_rates']), k
     # Last resort: case-insensitive search
     key_low = key.lower()
     for k in spectra.keys():
         if key_low == k.lower() or k.lower().startswith(key_low + '#'):
             entry = spectra[k]
-            return np.asarray(entry['energies_eV']), np.asarray(entry['pka_rates']), k
+            return np.asarray(entry['energies']), np.asarray(entry['pka_rates']), k
     raise KeyError(f"Key '{key}' not found in JSON {json_path}. Available keys include e.g.: {list(spectra.keys())[:8]} …")
 
 

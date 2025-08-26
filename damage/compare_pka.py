@@ -329,14 +329,14 @@ def read_spectra_pka_results(results_stub="Fe56_OpenMC"):
                         low_eV = np.array(energies_low, dtype=float) * 1e6
                         high_eV = np.array(energies_high, dtype=float) * 1e6
                         # Construct contiguous bin edges: [low0, high0, high1, ...]
-                        energy_edges_eV = np.concatenate([low_eV[:1], high_eV])
+                        energies = np.concatenate([low_eV[:1], high_eV])
 
                         all_reactions[current_index] = {
                             'name': current_reaction,
-                            'energy_edges_eV': energy_edges_eV,  # length N+1
+                            'energies': energies,  # length N+1
                             'pka_rates': np.array(pka_rates, dtype=float)  # length N
                         }
-                        print(f"  - Stored {len(pka_rates)} bins; {len(energy_edges_eV)} edges")
+                        print(f"  - Stored {len(pka_rates)} bins; {len(energies)} edges")
 
                     i = j - 1  # Continue from where we left off
             except (ValueError, IndexError):
@@ -420,7 +420,7 @@ def export_recoil_spectra_json(all_reactions: dict | None, results_stub: str, fi
     {
       "meta": {"results_stub": "...", "channels": N},
       "spectra": {
-         "Fe56(n,p)": {"energies_eV": [...bin edges...], "pka_rates": [...], "description": "raw description"},
+         "Fe56(n,p)": {"energies": [...bin edges...], "pka_rates": [...], "description": "raw description"},
          ...
       }
     }
@@ -447,14 +447,12 @@ def export_recoil_spectra_json(all_reactions: dict | None, results_stub: str, fi
         desc = data.get('name', '')
         label = format_reaction_label(desc)
         key = _unique_key(label)
-        edges = data.get('energy_edges_eV')
+        edges = data.get('energies')
         rates = data.get('pka_rates')
         # Convert numpy arrays to lists for JSON serialization
-        energies_list = edges.tolist() if hasattr(edges, 'tolist') else list(edges or [])
-        rates_list = rates.tolist() if hasattr(rates, 'tolist') else list(rates or [])
         spectra_map[key] = {
-            "energies_eV": energies_list,
-            "pka_rates": rates_list,
+            "energies": edges.tolist(),
+            "pka_rates": rates.tolist(),
             "description": desc,
         }
 
@@ -543,7 +541,7 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
             rates = np.asarray(data['pka_rates'])
             if not np.any(rates > 0):
                 continue
-            edges = np.asarray(data['energy_edges_eV'])
+            edges = np.asarray(data['energies'])
             rate_sum = float(rates.sum())  # PKAs/s across bins
             top10.append((rate_sum, name, edges, rates))
         top10.sort(reverse=True, key=lambda x: x[0])
@@ -567,7 +565,7 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
     # Plot 3: Total PKA spectrum (stairs with edges)
     if key_reactions is not None and 'total' in key_reactions:
         data = key_reactions['total']
-        edges = np.asarray(data['energy_edges_eV'])
+        edges = np.asarray(data['energies'])
         rates = np.asarray(data['pka_rates'])
         if np.any(rates > 0):
             ax3.stairs(rates, edges, color='k', linewidth=3, label='Total PKA Rate')
@@ -640,7 +638,7 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
             print("\nKey Reaction Channels:")
             total_all_rates = 0.0
             for reaction_type, data in key_reactions.items():
-                edges = np.asarray(data['energy_edges_eV'])
+                edges = np.asarray(data['energies'])
                 rates = np.asarray(data['pka_rates'])
                 if not np.any(rates > 0):
                     continue
@@ -659,7 +657,7 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
             # Damage analysis
             if 'total' in key_reactions:
                 data = key_reactions['total']
-                edges = np.asarray(data['energy_edges_eV'])
+                edges = np.asarray(data['energies'])
                 rates = np.asarray(data['pka_rates'])
                 if np.any(rates > 0):
                     print("\nDamage Analysis (40 eV threshold):")

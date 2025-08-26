@@ -1,4 +1,5 @@
 import os
+import json
 import re
 import subprocess
 from math import pi
@@ -19,7 +20,7 @@ def run_openmc_simulation():
     # Create natural Fe material (multi-nuclide)
     mat = openmc.Material()
     # First example: natural Fe (user request)
-    mat.add_element('Fe', 1.0)
+    mat.add_nuclide('Fe56', 1.0)
     mat.set_density('g/cm3', 7.874)
 
     # Create spherical geometry
@@ -32,7 +33,7 @@ def run_openmc_simulation():
 
     # Settings
     model.settings.batches = 20
-    model.settings.particles = 1000
+    model.settings.particles = 100000
     model.settings.run_mode = 'fixed source'
     model.settings.source = openmc.IndependentSource(
         space=openmc.stats.Point(),
@@ -47,15 +48,27 @@ def run_openmc_simulation():
     tally.scores = ['flux']
     model.tallies.append(tally)
 
+    # Create tally for recoil distribution
+    recoil_tally = openmc.Tally(name="recoil_distribution")
+    particle_filter = openmc.ParticleFilter(['recoil'])
+    ccfe709 = openmc.EnergyFilter.from_group_structure('CCFE-709')
+    recoil_tally.filters = [particle_filter, ccfe709]
+    recoil_tally.estimator = 'collision'
+    recoil_tally.scores = ['flux']  # TODO: need a 'weight' score
+    model.tallies.append(recoil_tally)
+
     # Run simulation
     model.run(apply_tally_results=True)
 
-    # Extract results
+    # Extract flux in n-cm/s
     flux = tally.mean.ravel()
-    flux /= cell.volume  # Convert to flux per unit volume
+
+    # Convert flux to n/s/b
+    atom_per_barn_cm = sum(mat.get_nuclide_atom_densities().values())
+    flux *= atom_per_barn_cm
     energies = energy_filter.values  # Energy bin boundaries in eV
 
-    return flux, energies, model
+    return flux, energies, mat
 
 
 def create_spectra_pka_flux_file(flux, energies, filename="openmc_flux.dat"):
@@ -127,8 +140,8 @@ def _atomic_mass_amu(nuc: str) -> float:
 
 def create_spectra_pka_input_file(
     flux_filename,
+    material: openmc.Material,
     results_stub="Fe_OpenMC",
-    model: openmc.Model | None = None,
     pka_base_dir: str = "/opt/data/spectra-pka/tendl2019/pka",
 ):
     """Create SPECTRA-PKA input file.
@@ -140,23 +153,8 @@ def create_spectra_pka_input_file(
     print(f"Creating SPECTRA-PKA input file: {input_filename}")
 
     # Collect nuclides present in the model geometry
-    nuclides = []
-    if model is not None and model.geometry is not None:
-        try:
-            # Can return dict-like of nuclides; normalize to strings
-            found = model.geometry.get_all_nuclides()
-            # found may be dict of {Nuclide/str: float}; take the keys
-            for k in (found.keys() if hasattr(found, 'keys') else list(found)):
-                name = getattr(k, 'name', None) or (str(k) if not isinstance(k, str) else k)
-                nuclides.append(name)
-        except Exception:
-            pass
-
-    # Fallback: if we couldn't query, assume Fe natural set
-    if not nuclides:
-        nuclides = ["Fe054", "Fe056", "Fe057", "Fe058"]  # strings may not match 'Fe56'
-        # Normalize to standard 'Fe54' etc
-        nuclides = [f"Fe{int(n[2:]):d}" if n.startswith("Fe") else n for n in nuclides]
+    nuclides = material.get_nuclides()
+    densities = material.get_nuclide_atom_densities()
 
     # Build rows for nuclides with available PKA files
     pka_rows = []
@@ -176,7 +174,7 @@ def create_spectra_pka_input_file(
         # Parent element symbol and mass number
         parent_ele = sym
         parent_num = A
-        pka_rows.append((pka_file, 1.0, parent_ele, parent_num, parent_mass, daughter_mass))
+        pka_rows.append((pka_file, densities[nuc], parent_ele, parent_num, parent_mass, daughter_mass))
 
     with open(input_filename, 'w') as f:
         f.write(f'flux_filename="{flux_filename}"\n')
@@ -186,7 +184,7 @@ def create_spectra_pka_input_file(
         # One line per nuclide present
         for (pka_file, ratio, ele, anum, m_parent, m_daughter) in pka_rows:
             f.write(f'"{pka_file}" {ratio:.1f} {ele} {anum} {m_parent} {m_daughter}\n')
-        f.write('flux_norm_type=2\n')
+        f.write('flux_norm_type=3\n')
         f.write('pka_filetype=2\n')
         f.write('do_mtd_sums=.true.\n')
         f.write('do_ngamma_estimate=.t.\n')
@@ -369,6 +367,112 @@ def read_spectra_pka_results(results_stub="Fe56_OpenMC"):
     return all_reactions, key_reactions
 
 
+def format_reaction_label(desc: str) -> str:
+    """Format channel description into 'Target(n,xxx)' like 'Fe56(n,gamma)'.
+
+    This mirrors the labeling used in plots so JSON keys match what's shown.
+    """
+    # Find target after 'from [ Fe56 ]' or in 'recoil matrix of Fe56'
+    target = None
+    m = re.search(r"from\s*\[\s*([A-Za-z]{1,2}\d{2,3})\s*\]", desc)
+    if m:
+        target = m.group(1)
+    if not target:
+        m2 = re.search(r"recoil matrix of\s+([A-Za-z]{1,2}\d{0,3})", desc)
+        if m2:
+            target = m2.group(1)
+    # Extract reaction in parentheses containing 'n,' if present
+    rx = re.search(r"\((n,[^)]+)\)", desc)
+    reaction = None
+    if rx:
+        reaction = rx.group(1)
+        # Expand short forms
+        reaction = reaction.replace(',g', ',gamma').replace(',a', ',alpha')
+    elif 'scatter recoil matrix' in desc:
+        reaction = 'n,scatter'
+    elif re.search(r'total\s*\(z,p\)', desc):
+        reaction = 'n,p'
+    elif re.search(r'total\s*\(z,a\)', desc):
+        reaction = 'n,alpha'
+    elif 'estimated (n,g)' in desc:
+        reaction = 'n,gamma'
+    # Handle totals without explicit (z,*) tokens
+    if reaction is None:
+        if re.search(r'\btotal\s+proton\s+matrix\b', desc, re.IGNORECASE) or re.search(r'\bproton\s+matrix\b', desc, re.IGNORECASE):
+            reaction = 'n,p'
+        elif re.search(r'\btotal\s+alpha\s+matrix\b', desc, re.IGNORECASE) or re.search(r'\balpha\s+matrix\b', desc, re.IGNORECASE):
+            reaction = 'n,alpha'
+    # Fallbacks
+    if target and reaction:
+        return f"{target}({reaction})"
+    if target and 'recoil matrix' in desc:
+        return f"{target}(recoil)"
+    return desc
+
+
+def export_recoil_spectra_json(all_reactions: dict | None, results_stub: str, filename: str | None = None) -> str | None:
+    """Export recoil spectra to a JSON mapping of reaction label -> spectrum.
+
+    JSON structure:
+    {
+      "meta": {"results_stub": "...", "channels": N},
+      "spectra": {
+         "Fe56(n,p)": {"energies_eV": [...], "pka_rates": [...], "description": "raw description"},
+         ...
+      }
+    }
+
+    Returns the written filename, or None if nothing was written.
+    """
+    if not all_reactions:
+        return None
+
+    if filename is None:
+        filename = f"{results_stub}_recoil_spectra.json"
+
+    spectra_map: dict[str, dict] = {}
+
+    def _unique_key(base: str) -> str:
+        if base not in spectra_map:
+            return base
+        i = 2
+        while f"{base}#{i}" in spectra_map:
+            i += 1
+        return f"{base}#{i}"
+
+    for data in all_reactions.values():
+        desc = data.get('name', '')
+        label = format_reaction_label(desc)
+        key = _unique_key(label)
+        energies = data.get('energies')
+        rates = data.get('pka_rates')
+        # Convert numpy arrays to lists for JSON serialization
+        energies_list = energies.tolist() if hasattr(energies, 'tolist') else list(energies or [])
+        rates_list = rates.tolist() if hasattr(rates, 'tolist') else list(rates or [])
+        spectra_map[key] = {
+            "energies_eV": energies_list,
+            "pka_rates": rates_list,
+            "description": desc,
+        }
+
+    payload = {
+        "meta": {
+            "results_stub": results_stub,
+            "channels": len(spectra_map),
+        },
+        "spectra": spectra_map,
+    }
+
+    try:
+        with open(filename, 'w') as f:
+            json.dump(payload, f, indent=2)
+        print(f"Wrote recoil spectra JSON: {filename} ({len(spectra_map)} channels)")
+        return filename
+    except Exception as exc:
+        print(f"Failed to write JSON '{filename}': {exc}")
+        return None
+
+
 def plot_results(flux, flux_energies, all_reactions, key_reactions):
     """Plot OpenMC flux and SPECTRA-PKA results (2x2 layout)."""
     print("Creating plots...")
@@ -384,43 +488,8 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
         pass
 
     def _format_reaction_label(desc: str) -> str:
-        """Format channel description into 'Target(n,xxx)' like 'Fe56(n,gamma)'."""
-        # Find target after 'from [ Fe56 ]' or in 'recoil matrix of Fe56'
-        target = None
-        m = re.search(r"from\s*\[\s*([A-Za-z]{1,2}\d{2,3})\s*\]", desc)
-        if m:
-            target = m.group(1)
-        if not target:
-            m2 = re.search(r"recoil matrix of\s+([A-Za-z]{1,2}\d{0,3})", desc)
-            if m2:
-                target = m2.group(1)
-        # Extract reaction in parentheses containing 'n,' if present
-        rx = re.search(r"\((n,[^)]+)\)", desc)
-        reaction = None
-        if rx:
-            reaction = rx.group(1)
-            # Expand short forms
-            reaction = reaction.replace(',g', ',gamma').replace(',a', ',alpha')
-        elif 'scatter recoil matrix' in desc:
-            reaction = 'n,scatter'
-        elif re.search(r'total\s*\(z,p\)', desc):
-            reaction = 'n,p'
-        elif re.search(r'total\s*\(z,a\)', desc):
-            reaction = 'n,alpha'
-        elif 'estimated (n,g)' in desc:
-            reaction = 'n,gamma'
-        # Handle totals without explicit (z,*) tokens
-        if reaction is None:
-            if re.search(r'\btotal\s+proton\s+matrix\b', desc, re.IGNORECASE) or re.search(r'\bproton\s+matrix\b', desc, re.IGNORECASE):
-                reaction = 'n,p'
-            elif re.search(r'\btotal\s+alpha\s+matrix\b', desc, re.IGNORECASE) or re.search(r'\balpha\s+matrix\b', desc, re.IGNORECASE):
-                reaction = 'n,alpha'
-        # Fallbacks
-        if target and reaction:
-            return f"{target}({reaction})"
-        if target and 'recoil matrix' in desc:
-            return f"{target}(recoil)"
-        return desc
+        # Delegate to the shared formatter so labels match JSON keys
+        return format_reaction_label(desc)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     ax1, ax2 = axes[0]
@@ -615,7 +684,7 @@ def main():
     print("=" * 60)
 
     # Step 1: Run OpenMC simulation
-    flux, energies, model = run_openmc_simulation()
+    flux, energies, material = run_openmc_simulation()
 
     # Step 2: Create SPECTRA-PKA flux file
     flux_filename = create_spectra_pka_flux_file(flux, energies)
@@ -624,8 +693,8 @@ def main():
     results_stub = "Fe_OpenMC"
     input_filename = create_spectra_pka_input_file(
         flux_filename,
+        material,
         results_stub,
-        model=model,
         pka_base_dir="/opt/data/spectra-pka/tendl2019/pka",
     )
 
@@ -637,6 +706,8 @@ def main():
     key_reactions = None
     if success:
         all_reactions, key_reactions = read_spectra_pka_results(results_stub)
+    # Export recoil spectra to JSON for post-processing/inspection
+    export_recoil_spectra_json(all_reactions, results_stub)
 
     # Step 6: Plot results
     plot_results(flux, energies, all_reactions, key_reactions)

@@ -21,7 +21,7 @@ import argparse
 import glob
 import json
 import os
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -45,7 +45,7 @@ def load_openmc_recoil_spectrum(statepoint_path: str, tally_name: str, tally_id:
     """
     with openmc.StatePoint(statepoint_path) as sp:
         tally = sp.get_tally(name=tally_name)
-        energies = tally.filters[1].values[:-1]
+        energies = tally.filters[1].values
         values = tally.mean.ravel()
 
         # Divide by volume to get per-unit-volume rates
@@ -80,8 +80,10 @@ def plot_compare(openmc_E: np.ndarray, openmc_Y: np.ndarray, json_E: np.ndarray,
                  json_key: str, title_suffix: str = "") -> None:
     plt.figure(figsize=(8, 6))
 
-    plt.loglog(openmc_E, openmc_Y, label='OpenMC tally (recoil_distribution)', lw=2)
-    plt.loglog(json_E, json_Y, label=f'SPECTRA-PKA JSON ({json_key})', lw=2)
+    plt.stairs(openmc_Y, openmc_E, label='OpenMC tally (recoil_distribution)', lw=2)
+    plt.stairs(json_Y, json_E, label=f'SPECTRA-PKA JSON ({json_key})', lw=2)
+    plt.xscale('log')
+    plt.yscale('log')
     plt.xlabel('Recoil Energy [eV]')
     plt.ylabel('Rate [PKAs/s/cm³]')
     title = 'Recoil Spectrum Comparison'

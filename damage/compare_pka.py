@@ -19,9 +19,7 @@ def run_openmc_simulation():
 
     openmc.config['cross_sections'] = '/opt/data/hdf5/tendl-2019-hdf5/cross_sections.xml'
 
-    # Create natural Fe material (multi-nuclide)
     mat = openmc.Material()
-    # First example: natural Fe (user request)
     mat.add_nuclide('Fe56', 1.0)
     mat.set_density('g/cm3', 7.874)
     R = 10.0
@@ -45,7 +43,7 @@ def run_openmc_simulation():
 
     # Create tally for neutron flux
     tally = openmc.Tally()
-    energy_filter = openmc.EnergyFilter.from_group_structure('VITAMIN-J-175')
+    energy_filter = openmc.EnergyFilter.from_group_structure('CCFE-709')
     tally.filters = [energy_filter]
     tally.scores = ['flux']
     model.tallies.append(tally)
@@ -296,7 +294,7 @@ def read_spectra_pka_results(results_stub="Fe56_OpenMC"):
                     current_reaction = reaction_channels[current_index]
                     print(f"Processing index {current_index}: {current_reaction}")
 
-                    # Initialize storage for this reaction
+                    # Initialize storage for this reaction (bin edges and per-bin PKAs/s)
                     energies_low = []
                     energies_high = []
                     pka_rates = []
@@ -314,9 +312,9 @@ def read_spectra_pka_results(results_stub="Fe56_OpenMC"):
                         if data_line and not data_line.startswith('#') and len(data_line.split()) >= 3:
                             try:
                                 parts = data_line.split()
-                                energy_low = float(parts[0])  # MeV
-                                energy_high = float(parts[1])  # MeV
-                                pka_rate = float(parts[2])   # PKAs/s
+                                energy_low = float(parts[0])   # MeV (bin low)
+                                energy_high = float(parts[1])  # MeV (bin high)
+                                pka_rate = float(parts[2])     # PKAs/s in bin
 
                                 energies_low.append(energy_low)
                                 energies_high.append(energy_high)
@@ -327,17 +325,18 @@ def read_spectra_pka_results(results_stub="Fe56_OpenMC"):
 
                     # Store data if we found any
                     if energies_low and pka_rates:
-                        # Convert to numpy arrays and eV
-                        energies_low_ev = np.array(energies_low) * 1e6  # MeV to eV
-                        energies_high_ev = np.array(energies_high) * 1e6  # MeV to eV
-                        energy_centers = (energies_low_ev + energies_high_ev) / 2
+                        # Convert to numpy arrays and eV (edges length N+1)
+                        low_eV = np.array(energies_low, dtype=float) * 1e6
+                        high_eV = np.array(energies_high, dtype=float) * 1e6
+                        # Construct contiguous bin edges: [low0, high0, high1, ...]
+                        energy_edges_eV = np.concatenate([low_eV[:1], high_eV])
 
                         all_reactions[current_index] = {
                             'name': current_reaction,
-                            'energies': energy_centers,
-                            'pka_rates': np.array(pka_rates)
+                            'energy_edges_eV': energy_edges_eV,  # length N+1
+                            'pka_rates': np.array(pka_rates, dtype=float)  # length N
                         }
-                        print(f"  - Stored {len(energy_centers)} data points")
+                        print(f"  - Stored {len(pka_rates)} bins; {len(energy_edges_eV)} edges")
 
                     i = j - 1  # Continue from where we left off
             except (ValueError, IndexError):
@@ -421,7 +420,7 @@ def export_recoil_spectra_json(all_reactions: dict | None, results_stub: str, fi
     {
       "meta": {"results_stub": "...", "channels": N},
       "spectra": {
-         "Fe56(n,p)": {"energies_eV": [...], "pka_rates": [...], "description": "raw description"},
+         "Fe56(n,p)": {"energies_eV": [...bin edges...], "pka_rates": [...], "description": "raw description"},
          ...
       }
     }
@@ -448,10 +447,10 @@ def export_recoil_spectra_json(all_reactions: dict | None, results_stub: str, fi
         desc = data.get('name', '')
         label = format_reaction_label(desc)
         key = _unique_key(label)
-        energies = data.get('energies')
+        edges = data.get('energy_edges_eV')
         rates = data.get('pka_rates')
         # Convert numpy arrays to lists for JSON serialization
-        energies_list = energies.tolist() if hasattr(energies, 'tolist') else list(energies or [])
+        energies_list = edges.tolist() if hasattr(edges, 'tolist') else list(edges or [])
         rates_list = rates.tolist() if hasattr(rates, 'tolist') else list(rates or [])
         spectra_map[key] = {
             "energies_eV": energies_list,
@@ -495,6 +494,30 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
         # Delegate to the shared formatter so labels match JSON keys
         return format_reaction_label(desc)
 
+    def _stairs_positive(ax, edges_eV, y, **kwargs):
+        """Plot stairs only where y > 0 to keep log scales happy."""
+        y = np.asarray(y)
+        edges_eV = np.asarray(edges_eV)
+        if y.size + 1 != edges_eV.size:
+            # Try to coerce shapes by truncation
+            n = min(y.size, edges_eV.size - 1)
+            y = y[:n]
+            edges_eV = edges_eV[: n + 1]
+        mask = y > 0
+        if not np.any(mask):
+            return
+        idx = np.where(mask)[0]
+        start = idx[0]
+        last = idx[0]
+        for k in idx[1:]:
+            if k == last + 1:
+                last = k
+            else:
+                ax.stairs(y[start:last+1], edges_eV[start:last+2], **kwargs)
+                start = k
+                last = k
+        ax.stairs(y[start:last+1], edges_eV[start:last+2], **kwargs)
+
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     ax1, ax2 = axes[0]
     ax3, ax4 = axes[1]
@@ -516,7 +539,7 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
 
     # Colors dict removed; plots use default color cycle for simplicity
 
-    # Plot 2: Top-10 channels by integrated PKAs/s (standard reactions only)
+    # Plot 2: Top-10 channels by total PKAs/s (standard reactions only)
     top10 = []
     if all_reactions is not None:
         def _is_standard_channel(name: str) -> bool:
@@ -545,37 +568,37 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
             # Only consider standard reaction channels, not aggregates
             if not _is_standard_channel(name):
                 continue
-            nonzero_mask = data['pka_rates'] > 0
-            if not np.any(nonzero_mask):
+            rates = np.asarray(data['pka_rates'])
+            if not np.any(rates > 0):
                 continue
-            energies = data['energies'][nonzero_mask]
-            rates = data['pka_rates'][nonzero_mask]
-            rate_int = np.trapezoid(rates, energies)
-            top10.append((rate_int, name, energies, rates))
+            edges = np.asarray(data['energy_edges_eV'])
+            rate_sum = float(rates.sum())  # PKAs/s across bins
+            top10.append((rate_sum, name, edges, rates))
         top10.sort(reverse=True, key=lambda x: x[0])
         top10 = top10[:10]
 
         # Plot them
         color_cycle = plt.cm.tab10.colors
-        for i, (rate_int, name, energies, rates) in enumerate(top10):
+        for i, (rate_sum, name, edges, rates) in enumerate(top10):
             label = _format_reaction_label(name)
-            ax2.loglog(energies, rates, label=f"{i+1}. {label}", color=color_cycle[i % len(color_cycle)], linewidth=1.8)
+            _stairs_positive(ax2, edges, rates, label=f"{i+1}. {label}", color=color_cycle[i % len(color_cycle)], linewidth=1.8)
 
         ax2.set_xlabel('PKA Energy [eV]')
         ax2.set_ylabel('PKA Rate [PKAs/s]')
-        ax2.set_title('Top-10 Channels by Integrated PKAs/s')
+        ax2.set_title('Top-10 Channels by Total PKAs/s')
+        ax2.set_xscale('log')
+        ax2.set_yscale('log')
         ax2.grid(True, alpha=0.3)
         if top10:
             ax2.legend(fontsize=7)
 
-    # Plot 3: Total PKA spectrum
+    # Plot 3: Total PKA spectrum (stairs with edges)
     if key_reactions is not None and 'total' in key_reactions:
         data = key_reactions['total']
-        nonzero_mask = data['pka_rates'] > 0
-        if np.any(nonzero_mask):
-            energies = data['energies'][nonzero_mask]
-            rates = data['pka_rates'][nonzero_mask]
-            ax3.loglog(energies, rates, 'k-', linewidth=3, label='Total PKA Rate')
+        edges = np.asarray(data['energy_edges_eV'])
+        rates = np.asarray(data['pka_rates'])
+        if np.any(rates > 0):
+            _stairs_positive(ax3, edges, rates, color='k', linewidth=3, label='Total PKA Rate')
 
             # Add damage threshold
             damage_threshold = 40  # eV
@@ -583,15 +606,15 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
                        label=f'Damage Threshold ({damage_threshold} eV)')
 
             # Add statistics
-            total_pka_rate = np.trapezoid(rates, energies)
-            above_threshold = energies >= damage_threshold
-            if np.any(above_threshold):
-                damage_rate = np.trapezoid(rates[above_threshold], energies[above_threshold])
-                ax3.text(0.02, 0.98, f'Total: {total_pka_rate:.2e} PKAs/s\n'
-                                     f'Above {damage_threshold} eV: {damage_rate:.2e} PKAs/s\n'
-                                     f'Fraction: {damage_rate/total_pka_rate:.1%}',
-                         transform=ax3.transAxes, verticalalignment='top',
-                         bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.8))
+            total_pka_rate = float(rates.sum())
+            mask_above = edges[1:] >= damage_threshold
+            damage_rate = float(rates[mask_above].sum()) if np.any(mask_above) else 0.0
+            frac = damage_rate / total_pka_rate if total_pka_rate > 0 else 0.0
+            ax3.text(0.02, 0.98, f'Total: {total_pka_rate:.2e} PKAs/s\n'
+                                 f'Above {damage_threshold} eV: {damage_rate:.2e} PKAs/s\n'
+                                 f'Fraction: {frac:.1%}',
+                     transform=ax3.transAxes, verticalalignment='top',
+                     bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.8))
 
     ax3.set_xlabel('PKA Energy [eV]')
     ax3.set_ylabel('PKA Rate [PKAs/s]')
@@ -606,7 +629,7 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
         colors_list = [plt.cm.tab10.colors[i % 10] for i in range(len(top10))]
         bars = ax4.bar(range(len(names)), rates, color=colors_list)
         ax4.set_xlabel('Reaction Channel (Top-10)')
-        ax4.set_ylabel('Integrated PKA Rate [PKAs/s]')
+        ax4.set_ylabel('Total PKAs/s')
         ax4.set_title('Top-10 Channel Contributions')
         ax4.set_yscale('log')
         ax4.set_xticks(range(len(names)))
@@ -643,40 +666,37 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
         # Summary of key reactions
         if key_reactions:
             print("\nKey Reaction Channels:")
-            total_all_rates = 0
+            total_all_rates = 0.0
             for reaction_type, data in key_reactions.items():
-                nonzero_mask = data['pka_rates'] > 0
-                if np.any(nonzero_mask):
-                    energies = data['energies'][nonzero_mask]
-                    rates = data['pka_rates'][nonzero_mask]
-                    integrated_rate = np.trapezoid(rates, energies)
-                    max_rate = np.max(rates)
-                    energy_range = f"{energies.min():.1e} - {energies.max():.1e}"
+                edges = np.asarray(data['energy_edges_eV'])
+                rates = np.asarray(data['pka_rates'])
+                if not np.any(rates > 0):
+                    continue
+                integrated_rate = float(rates.sum())
+                max_rate = float(np.max(rates))
+                energy_range = f"{edges[0]:.1e} - {edges[-1]:.1e}"
 
-                    print(f"  {reaction_type:12s}: {integrated_rate:.2e} PKAs/s "
-                          f"(max: {max_rate:.2e}, range: {energy_range} eV)")
+                print(f"  {reaction_type:12s}: {integrated_rate:.2e} PKAs/s "
+                      f"(max: {max_rate:.2e}, range: {energy_range} eV)")
 
-                    if reaction_type != 'total':
-                        total_all_rates += integrated_rate
+                if reaction_type != 'total':
+                    total_all_rates += integrated_rate
 
             print(f"\nSum of individual reactions: {total_all_rates:.2e} PKAs/s")
 
             # Damage analysis
             if 'total' in key_reactions:
                 data = key_reactions['total']
-                nonzero_mask = data['pka_rates'] > 0
-                if np.any(nonzero_mask):
-                    energies = data['energies'][nonzero_mask]
-                    rates = data['pka_rates'][nonzero_mask]
-
+                edges = np.asarray(data['energy_edges_eV'])
+                rates = np.asarray(data['pka_rates'])
+                if np.any(rates > 0):
                     print("\nDamage Analysis (40 eV threshold):")
                     for threshold in [10, 40, 100, 1000]:
-                        above_threshold = energies >= threshold
-                        if np.any(above_threshold):
-                            damage_rate = np.trapezoid(rates[above_threshold], energies[above_threshold])
-                            total_rate = np.trapezoid(rates, energies)
-                            fraction = damage_rate / total_rate if total_rate > 0 else 0
-                            print(f"  Above {threshold:4d} eV: {damage_rate:.2e} PKAs/s ({fraction:.1%})")
+                        mask_above = edges[1:] >= threshold
+                        damage_rate = float(rates[mask_above].sum()) if np.any(mask_above) else 0.0
+                        total_rate = float(rates.sum())
+                        fraction = damage_rate / total_rate if total_rate > 0 else 0.0
+                        print(f"  Above {threshold:4d} eV: {damage_rate:.2e} PKAs/s ({fraction:.1%})")
 
     print("="*80)
 

@@ -17,17 +17,19 @@ def run_openmc_simulation():
     """
     print("Running OpenMC simulation...")
 
+    openmc.config['cross_sections'] = '/opt/data/hdf5/tendl-2019-hdf5/cross_sections.xml'
+
     # Create natural Fe material (multi-nuclide)
     mat = openmc.Material()
     # First example: natural Fe (user request)
     mat.add_nuclide('Fe56', 1.0)
     mat.set_density('g/cm3', 7.874)
+    R = 10.0
+    mat.volume = 4/3 * pi * R**3
 
     # Create spherical geometry
-    R = 10.0
     sph = openmc.Sphere(r=R, boundary_type='vacuum')
     cell = openmc.Cell(fill=mat, region=-sph)
-    cell.volume = 4/3 * pi * R**3
     model = openmc.Model()
     model.geometry = openmc.Geometry([cell])
 
@@ -63,9 +65,8 @@ def run_openmc_simulation():
     # Extract flux in n-cm/s
     flux = tally.mean.ravel()
 
-    # Convert flux to n/s/b
-    atom_per_barn_cm = sum(mat.get_nuclide_atom_densities().values())
-    flux *= atom_per_barn_cm
+    # Convert flux to n/cm²-s
+    flux /= mat.volume
     energies = energy_filter.values  # Energy bin boundaries in eV
 
     return flux, energies, mat
@@ -155,6 +156,8 @@ def create_spectra_pka_input_file(
     # Collect nuclides present in the model geometry
     nuclides = material.get_nuclides()
     densities = material.get_nuclide_atom_densities()
+    atoms = sum(material.get_nuclide_atoms().values())
+    atoms_per_cc = atoms / material.volume
 
     # Build rows for nuclides with available PKA files
     pka_rows = []
@@ -184,7 +187,8 @@ def create_spectra_pka_input_file(
         # One line per nuclide present
         for (pka_file, ratio, ele, anum, m_parent, m_daughter) in pka_rows:
             f.write(f'"{pka_file}" {ratio:.1f} {ele} {anum} {m_parent} {m_daughter}\n')
-        f.write('flux_norm_type=3\n')
+        f.write('flux_norm_type=2\n')
+        f.write(f'flux_rescale_value={atoms_per_cc}\n')
         f.write('pka_filetype=2\n')
         f.write('do_mtd_sums=.true.\n')
         f.write('do_ngamma_estimate=.t.\n')

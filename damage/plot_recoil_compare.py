@@ -47,6 +47,10 @@ def load_openmc_recoil_spectrum(statepoint_path: str, tally_name: str, tally_id:
         tally = sp.get_tally(name=tally_name)
         energies = tally.filters[1].values[:-1]
         values = tally.mean.ravel()
+
+        # Divide by volume to get per-unit-volume rates
+        values /= sp.summary.materials[0].volume
+
         return energies, values
 
 
@@ -75,13 +79,11 @@ def load_json_spectrum(json_path: str, key: str) -> Tuple[np.ndarray, np.ndarray
 def plot_compare(openmc_E: np.ndarray, openmc_Y: np.ndarray, json_E: np.ndarray, json_Y: np.ndarray,
                  json_key: str, title_suffix: str = "") -> None:
     plt.figure(figsize=(8, 6))
-    # Guard against nonpositive values for log plot
-    #ok1 = (openmc_E > 0) & (openmc_Y > 0)
-    #ok2 = (json_E > 0) & (json_Y > 0)
+
     plt.loglog(openmc_E, openmc_Y, label='OpenMC tally (recoil_distribution)', lw=2)
     plt.loglog(json_E, json_Y, label=f'SPECTRA-PKA JSON ({json_key})', lw=2)
     plt.xlabel('Recoil Energy [eV]')
-    plt.ylabel('Rate [1/s]')
+    plt.ylabel('Rate [PKAs/s/cm³]')
     title = 'Recoil Spectrum Comparison'
     if title_suffix:
         title += f' — {title_suffix}'

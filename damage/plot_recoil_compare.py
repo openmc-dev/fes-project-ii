@@ -45,7 +45,7 @@ def load_openmc_recoil_spectrum(statepoint_path: str, tally_name: str, tally_id:
     """
     with openmc.StatePoint(statepoint_path) as sp:
         tally = sp.get_tally(name=tally_name)
-        energies = tally.filters[1].values
+        energies = tally.filters[0].energies
         values = tally.mean.ravel()
 
         # Divide by volume to get per-unit-volume rates

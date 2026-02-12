@@ -35,6 +35,7 @@ def run_openmc_simulation():
     model.settings.batches = 20
     model.settings.particles = 100000
     model.settings.run_mode = 'fixed source'
+    model.settings.recoil_production = True
     model.settings.source = openmc.IndependentSource(
         space=openmc.stats.Point(),
         energy=openmc.stats.delta_function(14.0e6),
@@ -50,11 +51,10 @@ def run_openmc_simulation():
 
     # Create tally for recoil distribution
     recoil_tally = openmc.Tally(name="recoil_distribution")
-    particle_filter = openmc.ParticleFilter(['recoil'])
-    ccfe709 = openmc.EnergyFilter.from_group_structure('CCFE-709')
-    recoil_tally.filters = [particle_filter, ccfe709]
-    recoil_tally.estimator = 'collision'
-    recoil_tally.scores = ['flux']  # TODO: need a 'weight' score
+    prod_filter = openmc.ParticleProductionFilter(['Fe56'], 'CCFE-709')
+    reaction_filter = openmc.ReactionFilter(['(n,elastic)', '(n,n1)', '(n,nc)', '(n,2n)'])
+    recoil_tally.filters = [prod_filter, reaction_filter]
+    recoil_tally.scores = ['events']
     model.tallies.append(recoil_tally)
 
     # Run simulation

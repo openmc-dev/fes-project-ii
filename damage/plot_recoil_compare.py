@@ -50,8 +50,8 @@ def load_openmc_recoil_spectrum(statepoint_path: str, tally_name: str, tally_id:
         reactions = [str(x) for x in reaction_filter.bins]
         energies = prod_filter.energies
         values = tally.get_reshaped_data(expand_dims=True) # (particle, energy, reaction, nuc, score)
-        recoil = 'Fe55'
-        reaction = '(n,2n)'
+        recoil = 'Fe56'
+        reaction = '(n,elastic)'
         particle_index = prod_filter.particles.index(recoil)
         reaction_index = reactions.index(reaction)
         values = values[particle_index, :, reaction_index, 0, 0]

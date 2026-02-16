@@ -8,14 +8,23 @@ Plot comparison of OpenMC recoil spectrum vs SPECTRA-PKA JSON spectrum.
 - Extracts the spectrum matching the given (reaction, product) combination
 - Plots both spectra on the same axes for visual comparison
 
+If no --reaction/--product arguments are given, the script iterates over
+each reaction in the statepoint's ReactionFilter and plots all matching
+products found in the JSON.  Products not present in the statepoint's
+ParticleProductionFilter are skipped with a diagnostic message.
+
 Usage examples:
+  # Plot all available (reaction, product) combinations:
   python3 damage/plot_recoil_compare.py \
       --statepoint statepoint.20.h5 \
-      --json Fe_OpenMC_recoil_spectra.json \
+      --json Fe_OpenMC_recoil_spectra.json
+
+  # Plot a single combination:
+  python3 damage/plot_recoil_compare.py \
       --reaction "(n,elastic)" --product Fe56
 
-  python3 damage/plot_recoil_compare.py \
-      --reaction "(n,2n)" --product Fe55
+  # Plot all products for a specific reaction:
+  python3 damage/plot_recoil_compare.py --reaction "(n,2n)"
 """
 from __future__ import annotations
 
@@ -23,7 +32,7 @@ import argparse
 import glob
 import json
 import os
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -38,6 +47,38 @@ def find_latest_statepoint() -> Optional[str]:
     # Sort by mtime descending
     candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return candidates[0]
+
+
+def get_statepoint_info(
+    statepoint_path: str,
+    tally_name: str,
+) -> Tuple[List[str], List[str]]:
+    """Return (reactions, products) available in the statepoint tally."""
+    with openmc.StatePoint(statepoint_path) as sp:
+        tally = sp.get_tally(name=tally_name)
+        prod_filter = tally.filters[0]
+        reaction_filter = tally.filters[1]
+        reactions = [str(x) for x in reaction_filter.bins]
+        products = list(prod_filter.particles)
+    return reactions, products
+
+
+def get_json_products_for_reaction(
+    json_path: str,
+    reaction: str,
+) -> List[str]:
+    """Return all distinct product nuclides in the JSON for *reaction*."""
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    products = []
+    seen = set()
+    for entry in data.get('spectra', {}).values():
+        if entry.get('reaction') == reaction:
+            p = entry.get('product')
+            if p and p not in seen:
+                seen.add(p)
+                products.append(p)
+    return products
 
 
 def load_openmc_recoil_spectrum(
@@ -157,12 +198,14 @@ def plot_compare(openmc_E: np.ndarray, openmc_Y: np.ndarray, json_E: np.ndarray,
     plt.yscale('log')
     plt.xlabel('Recoil Energy [eV]')
     plt.ylabel('Rate [PKAs/s/cm³]')
-    title = f'Recoil Spectrum: {reaction} \u2192 {product}'
+    title = f'Recoil Spectrum: {reaction} → {product}'
     plt.title(title)
     plt.grid(True, which='both', alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig('recoil_spectrum_comparison.png')
+    # Build a filename-safe tag from the reaction and product
+    tag = f"{reaction.replace('(','').replace(')','').replace(',','_')}_{product}"
+    plt.savefig(f'spectrum_comparison_{tag}.png')
     plt.show()
 
 
@@ -172,8 +215,12 @@ def main():
     parser.add_argument('--tally-name', type=str, default='recoil_distribution', help='Name of OpenMC tally to use')
     parser.add_argument('--list-tallies', action='store_true', help='List tallies in the statepoint and exit')
     parser.add_argument('--json', type=str, default='Fe_OpenMC_recoil_spectra.json', help='Path to recoil spectra JSON file')
-    parser.add_argument('--reaction', type=str, default='(n,elastic)', help='OpenMC reaction name, e.g. "(n,elastic)"')
-    parser.add_argument('--product', type=str, default='Fe56', help='Nuclide name of the reaction product, e.g. "Fe56"')
+    parser.add_argument('--reaction', type=str, default=None,
+                        help='OpenMC reaction name, e.g. "(n,elastic)". '
+                             'If omitted, iterates over all reactions in the tally.')
+    parser.add_argument('--product', type=str, default=None,
+                        help='Nuclide name of the reaction product, e.g. "Fe56". '
+                             'If omitted, plots all products found in the JSON for each reaction.')
     args = parser.parse_args()
 
     statepoint = args.statepoint or find_latest_statepoint()
@@ -194,16 +241,50 @@ def main():
                 print(f"  - id:{t.id} name:'{getattr(t, 'name', '')}' filters:{filters} scores:{scores}")
         return
 
-    # Load data
-    E_openmc, Y_openmc = load_openmc_recoil_spectrum(
-        statepoint, args.tally_name, args.reaction, args.product
-    )
-    E_json, Y_json, found_key = load_json_spectrum(
-        args.json, args.reaction, args.product
-    )
+    # Build list of (reaction, product) pairs to plot
+    tally_reactions, tally_products = get_statepoint_info(statepoint, args.tally_name)
 
-    # Plot
-    plot_compare(E_openmc, Y_openmc, E_json, Y_json, args.reaction, args.product)
+    if args.reaction is not None and args.product is not None:
+        # Explicit single combination
+        pairs = [(args.reaction, args.product)]
+    elif args.reaction is not None:
+        # Specific reaction, all products from JSON
+        json_products = get_json_products_for_reaction(args.json, args.reaction)
+        pairs = [(args.reaction, p) for p in json_products]
+    else:
+        # All reactions from the tally, all products from JSON for each
+        pairs = []
+        for rx in tally_reactions:
+            json_products = get_json_products_for_reaction(args.json, rx)
+            for p in json_products:
+                pairs.append((rx, p))
+
+    if not pairs:
+        print("No (reaction, product) pairs to plot.")
+        return
+
+    for reaction, product in pairs:
+        # Check JSON availability
+        try:
+            E_json, Y_json, found_key = load_json_spectrum(
+                args.json, reaction, product
+            )
+        except KeyError as exc:
+            print(f"Skipping {reaction} -> {product}: not found in JSON ({exc})")
+            continue
+
+        # Check statepoint availability
+        if product not in tally_products:
+            print(f"Skipping {reaction} -> {product}: "
+                  f"'{product}' is not available in the statepoint's "
+                  f"ParticleProductionFilter (available: {tally_products})")
+            continue
+
+        E_openmc, Y_openmc = load_openmc_recoil_spectrum(
+            statepoint, args.tally_name, reaction, product
+        )
+
+        plot_compare(E_openmc, Y_openmc, E_json, Y_json, reaction, product)
 
 
 if __name__ == '__main__':

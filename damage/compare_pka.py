@@ -52,7 +52,7 @@ def run_openmc_simulation():
 
     # Create tally for recoil distribution
     recoil_tally = openmc.Tally(name="recoil_distribution")
-    prod_filter = openmc.ParticleProductionFilter(['Fe56'], 'CCFE-709')
+    prod_filter = openmc.ParticleProductionFilter(['Fe55', 'Fe56'], 'CCFE-709')
     reaction_filter = openmc.ReactionFilter(['(n,elastic)', '(n,n1)', '(n,nc)', '(n,2n)'])
     recoil_tally.filters = [prod_filter, reaction_filter]
     recoil_tally.scores = ['events']

@@ -2,6 +2,7 @@ import os
 import json
 import re
 import subprocess
+import argparse
 from math import pi
 
 import openmc
@@ -200,12 +201,10 @@ def create_spectra_pka_input_file(
     return input_filename
 
 
-def run_spectra_pka(input_filename):
+def run_spectra_pka(input_filename, spectra_pka_exe="spectra-pka"):
     """Run SPECTRA-PKA with the given input file"""
     print(f"Running SPECTRA-PKA with input file: {input_filename}")
-
-    # Path to SPECTRA-PKA executable
-    spectra_pka_exe = "damage/SPECTRA-PKA/spectra-pka"
+    print(f"Using SPECTRA-PKA executable: {spectra_pka_exe}")
 
     try:
         # Run SPECTRA-PKA
@@ -672,9 +671,18 @@ def plot_results(flux, flux_energies, all_reactions, key_reactions):
 
 
 def main():
-    """Main function to run the complete analysis"""
+    """Main function to run the complete analysis"""    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="OpenMC + SPECTRA-PKA Integration"
+    )
+    parser.add_argument(
+        "--spectra-pka",
+        default="spectra-pka",
+        help="Path to SPECTRA-PKA executable"
+    )
+    args = parser.parse_args()
     print("=" * 60)
-    print("OpenMC + SPECTRA-PKA Integration for Fe56 PKA Analysis")
+    print("OpenMC + SPECTRA-PKA Integration")
     print("=" * 60)
 
     # Step 1: Run OpenMC simulation
@@ -693,7 +701,7 @@ def main():
     )
 
     # Step 4: Run SPECTRA-PKA
-    success = run_spectra_pka(input_filename)
+    success = run_spectra_pka(input_filename, args.spectra_pka)
 
     # Step 5: Read and analyze results
     all_reactions = None

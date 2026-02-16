@@ -45,8 +45,16 @@ def load_openmc_recoil_spectrum(statepoint_path: str, tally_name: str, tally_id:
     """
     with openmc.StatePoint(statepoint_path) as sp:
         tally = sp.get_tally(name=tally_name)
-        energies = tally.filters[0].energies
-        values = tally.mean.ravel()
+        prod_filter = tally.filters[0]
+        reaction_filter = tally.filters[1]
+        reactions = [str(x) for x in reaction_filter.bins]
+        energies = prod_filter.energies
+        values = tally.get_reshaped_data(expand_dims=True) # (particle, energy, reaction, nuc, score)
+        recoil = 'Fe55'
+        reaction = '(n,2n)'
+        particle_index = prod_filter.particles.index(recoil)
+        reaction_index = reactions.index(reaction)
+        values = values[particle_index, :, reaction_index, 0, 0]
 
         # Divide by volume to get per-unit-volume rates
         values /= sp.summary.materials[0].volume

@@ -348,83 +348,181 @@ def read_spectra_pka_results(results_stub="Fe56_OpenMC"):
     key_reactions = {}
     for idx, data in all_reactions.items():
         reaction_name = data['name']
-        # Categorize reactions based on exact descriptions from index file
-        if reaction_name.startswith('(n,elastic) recoil matrix'):
-            key_reactions['elastic'] = data
-        elif reaction_name.startswith('(n,inelastic) recoil matrix'):
-            key_reactions['inelastic'] = data
-        elif reaction_name.startswith('scatter recoil matrix'):
-            key_reactions['scatter'] = data
-        elif reaction_name.startswith('(n,2n) recoil matrix'):
-            key_reactions['n_2n'] = data
-        elif reaction_name.startswith('total (z,p) recoil matrix'):
-            key_reactions['n_p'] = data
-        elif reaction_name.startswith('total (z,a) recoil matrix'):
-            key_reactions['n_alpha'] = data
-        elif reaction_name.startswith('estimated (n,g) recoil matrix'):
-            key_reactions['n_gamma'] = data
-        elif 'recoil matrix (He+H+unknowns excluded)' in reaction_name:
-            key_reactions['total'] = data
+        parsed = parse_spectra_pka_description(reaction_name)
+        if parsed is not None:
+            rx = parsed['reaction']
+            if rx == '(n,elastic)':
+                key_reactions['elastic'] = data
+            elif rx == '(n,2n)':
+                key_reactions.setdefault('n_2n', data)
+            elif rx == '(n,gamma)':
+                key_reactions.setdefault('n_gamma', data)
+        else:
+            # Aggregates / totals
+            if reaction_name.startswith('scatter recoil matrix'):
+                key_reactions['scatter'] = data
+            elif reaction_name.startswith('total (z,p)'):
+                key_reactions['n_p'] = data
+            elif reaction_name.startswith('total (z,a)'):
+                key_reactions['n_alpha'] = data
+            elif 'recoil matrix (He+H+unknowns excluded)' in reaction_name:
+                key_reactions['total'] = data
 
     return all_reactions, key_reactions
 
 
-def format_reaction_label(desc: str) -> str:
-    """Format channel description into 'Target(n,xxx)' like 'Fe56(n,gamma)'.
+def spectra_pka_to_openmc_reaction(name: str) -> str:
+    """Translate a SPECTRA-PKA reaction name to its OpenMC-canonical form.
 
-    This mirrors the labeling used in plots so JSON keys match what's shown.
+    Examples:
+        '(n,n01)' -> '(n,n1)'
+        '(n,h)'   -> '(n,3He)'
+        '(n,g)'   -> '(n,gamma)'
+        '(n,a)'   -> '(n,a)'
     """
-    # Find target after 'from [ Fe56 ]' or in 'recoil matrix of Fe56'
-    target = None
-    m = re.search(r"from\s*\[\s*([A-Za-z]{1,2}\d{2,3})\s*\]", desc)
+    # Strip parentheses for internal processing
+    inner = name.strip()
+    if inner.startswith('(') and inner.endswith(')'):
+        inner = inner[1:-1]
+
+    # (n,n01) -> (n,n1), (n,n02) -> (n,n2), ... (strip zero-padding on inelastic levels)
+    m = re.match(r'^(n,n)0*(\d+)$', inner)
     if m:
-        target = m.group(1)
-    if not target:
-        m2 = re.search(r"recoil matrix of\s+([A-Za-z]{1,2}\d{0,3})", desc)
-        if m2:
-            target = m2.group(1)
-    # Extract reaction in parentheses containing 'n,' if present
-    rx = re.search(r"\((n,[^)]+)\)", desc)
-    reaction = None
-    if rx:
-        reaction = rx.group(1)
-        # Expand short forms
-        reaction = reaction.replace(',g', ',gamma').replace(',a', ',alpha')
-    elif 'scatter recoil matrix' in desc:
-        reaction = 'n,scatter'
-    elif re.search(r'total\s*\(z,p\)', desc):
-        reaction = 'n,p'
-    elif re.search(r'total\s*\(z,a\)', desc):
-        reaction = 'n,alpha'
-    elif 'estimated (n,g)' in desc:
-        reaction = 'n,gamma'
-    # Handle totals without explicit (z,*) tokens
-    if reaction is None:
-        if re.search(r'\btotal\s+proton\s+matrix\b', desc, re.IGNORECASE) or re.search(r'\bproton\s+matrix\b', desc, re.IGNORECASE):
-            reaction = 'n,p'
-        elif re.search(r'\btotal\s+alpha\s+matrix\b', desc, re.IGNORECASE) or re.search(r'\balpha\s+matrix\b', desc, re.IGNORECASE):
-            reaction = 'n,alpha'
-    # Fallbacks
-    if target and reaction:
-        return f"{target}({reaction})"
-    if target and 'recoil matrix' in desc:
-        return f"{target}(recoil)"
+        return f'({m.group(1)}{m.group(2)})'
+
+    # Simple renaming table
+    _MAP = {
+        'n,h': 'n,3He',
+        'n,g': 'n,gamma',
+    }
+    if inner in _MAP:
+        return f'({_MAP[inner]})'
+
+    # Everything else passes through unchanged
+    return f'({inner})'
+
+
+def parse_spectra_pka_description(desc: str) -> dict | None:
+    """Parse a SPECTRA-PKA .indexes description into structured fields.
+
+    Returns a dict with keys ``parent``, ``reaction``, ``product`` using
+    OpenMC-canonical reaction names, or *None* for entries that cannot be
+    parsed (input spectrum, aggregates, totals).
+
+    The *product* field is the nuclide appearing in the energy-differential
+    spectrum — it may be the heavy recoil (e.g. Cr53) **or** a light
+    emitted particle (H1, He4) depending on the matrix type.
+
+    Examples of raw descriptions and their parsed output:
+
+    ``(n,a) recoil matrix [ Cr53 ] from [ Fe56 ]/path``
+      -> {"parent": "Fe56", "reaction": "(n,a)", "product": "Cr53"}
+
+    ``(n,a) alpha matrix [ He4 ] from [ Fe56 ]/path``
+      -> {"parent": "Fe56", "reaction": "(n,a)", "product": "He4"}
+
+    ``estimated (n,g) recoil matrix [ Fe57 ] from [ Fe56 ]/path``
+      -> {"parent": "Fe56", "reaction": "(n,gamma)", "product": "Fe57"}
+
+    ``recoil matrix of Fe56`` -> None  (isotopic/elemental aggregate)
+    ``total recoil matrix (He+H+unknowns excluded)`` -> None  (total)
+    ``input_spectrum`` -> None
+    """
+    # --- Skip aggregates, totals, and input spectrum ---
+    if desc.startswith('input_spectrum'):
+        return None
+    if desc.startswith('recoil matrix of '):
+        return None
+    if desc.startswith('elemental recoil matrix of '):
+        return None
+    if 'total recoil matrix' in desc:
+        return None
+    if desc.startswith('scatter recoil matrix'):
+        return None
+    if re.match(r'total \(z,[^)]+\)', desc):
+        return None
+    if re.match(r'total (proton|alpha) matrix', desc, re.IGNORECASE):
+        return None
+
+    # --- Extract parent from "from [ Fe56 ]" ---
+    m_parent = re.search(r'from\s*\[\s*([A-Za-z]{1,2}\d{1,3})\s*\]', desc)
+    if not m_parent:
+        return None
+    parent = m_parent.group(1)
+
+    # --- Extract product from "[ Cr53 ]" (first bracket pair, before 'from') ---
+    m_product = re.search(r'\[\s*([A-Za-z]{1,2}\d{1,3})\s*\]', desc)
+    if not m_product:
+        return None
+    product = m_product.group(1)
+
+    # --- Extract and translate reaction ---
+    # Handle "estimated (n,g)" specially
+    if 'estimated (n,g)' in desc:
+        reaction = '(n,gamma)'
+    else:
+        m_rx = re.search(r'\((n,[^)]+)\)', desc)
+        if not m_rx:
+            return None
+        reaction = spectra_pka_to_openmc_reaction(f'({m_rx.group(1)})')
+
+    return {'parent': parent, 'reaction': reaction, 'product': product}
+
+
+def format_reaction_label(desc: str) -> str:
+    """Format channel description into a concise plot label.
+
+    Uses OpenMC-canonical reaction names.  Examples:
+        'Fe56 (n,a) -> Cr53'
+        'Fe56 (n,elastic) -> Fe56'
+    For aggregate / unparseable descriptions, returns the raw string.
+    """
+    parsed = parse_spectra_pka_description(desc)
+    if parsed is not None:
+        return f"{parsed['parent']} {parsed['reaction']} -> {parsed['product']}"
+    # Fallback for aggregates / totals — return a readable short form
+    if desc.startswith('recoil matrix of '):
+        nuc = desc.removeprefix('recoil matrix of ').strip()
+        return f"{nuc} (isotopic sum)"
+    if desc.startswith('elemental recoil matrix of '):
+        elem = desc.removeprefix('elemental recoil matrix of ').strip()
+        return f"{elem} (elemental sum)"
+    if 'total recoil matrix' in desc:
+        return 'Total PKA'
+    if desc.startswith('scatter recoil matrix'):
+        return 'Scatter (sum)'
     return desc
 
 
 def export_recoil_spectra_json(all_reactions: dict | None, results_stub: str, filename: str | None = None) -> str | None:
-    """Export recoil spectra to a JSON mapping of reaction label -> spectrum.
+    """Export recoil spectra to a JSON file with structured (parent, reaction, product) fields.
 
-    JSON structure:
-    {
-      "meta": {"results_stub": "...", "channels": N},
-      "spectra": {
-         "Fe56(n,p)": {"energies": [...bin edges...], "pka_rates": [...], "description": "raw description"},
-         ...
-      }
-    }
+    JSON structure::
 
-    Returns the written filename, or None if nothing was written.
+        {
+          "meta": {"results_stub": "...", "num_spectra": N, "num_aggregates": M},
+          "spectra": {
+            "Fe56|(n,a)|Cr53": {
+              "parent": "Fe56",
+              "reaction": "(n,a)",
+              "product": "Cr53",
+              "energies": [...],
+              "pka_rates": [...],
+              "description": "raw SPECTRA-PKA description"
+            },
+            ...
+          },
+          "aggregates": {
+            "Fe56 (isotopic sum)": {
+              "energies": [...],
+              "pka_rates": [...],
+              "description": "recoil matrix of Fe56"
+            },
+            ...
+          }
+        }
+
+    Returns the written filename, or ``None`` if nothing was written.
     """
     if not all_reactions:
         return None
@@ -433,40 +531,48 @@ def export_recoil_spectra_json(all_reactions: dict | None, results_stub: str, fi
         filename = f"{results_stub}_recoil_spectra.json"
 
     spectra_map: dict[str, dict] = {}
-
-    def _unique_key(base: str) -> str:
-        if base not in spectra_map:
-            return base
-        i = 2
-        while f"{base}#{i}" in spectra_map:
-            i += 1
-        return f"{base}#{i}"
+    aggregates_map: dict[str, dict] = {}
 
     for data in all_reactions.values():
         desc = data.get('name', '')
-        label = format_reaction_label(desc)
-        key = _unique_key(label)
         edges = data.get('energies')
         rates = data.get('pka_rates')
-        # Convert numpy arrays to lists for JSON serialization
-        spectra_map[key] = {
-            "energies": edges.tolist(),
-            "pka_rates": rates.tolist(),
-            "description": desc,
-        }
+
+        parsed = parse_spectra_pka_description(desc)
+        if parsed is not None:
+            key = f"{parsed['parent']}|{parsed['reaction']}|{parsed['product']}"
+            spectra_map[key] = {
+                "parent": parsed['parent'],
+                "reaction": parsed['reaction'],
+                "product": parsed['product'],
+                "energies": edges.tolist(),
+                "pka_rates": rates.tolist(),
+                "description": desc,
+            }
+        else:
+            # Aggregate / total / input spectrum
+            label = format_reaction_label(desc)
+            aggregates_map[label] = {
+                "energies": edges.tolist(),
+                "pka_rates": rates.tolist(),
+                "description": desc,
+            }
 
     payload = {
         "meta": {
             "results_stub": results_stub,
-            "channels": len(spectra_map),
+            "num_spectra": len(spectra_map),
+            "num_aggregates": len(aggregates_map),
         },
         "spectra": spectra_map,
+        "aggregates": aggregates_map,
     }
 
     try:
         with open(filename, 'w') as f:
             json.dump(payload, f, indent=2)
-        print(f"Wrote recoil spectra JSON: {filename} ({len(spectra_map)} channels)")
+        print(f"Wrote recoil spectra JSON: {filename} "
+              f"({len(spectra_map)} spectra, {len(aggregates_map)} aggregates)")
         return filename
     except Exception as exc:
         print(f"Failed to write JSON '{filename}': {exc}")

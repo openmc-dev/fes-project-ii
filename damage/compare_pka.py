@@ -188,7 +188,7 @@ def create_spectra_pka_input_file(
         f.write('flux_norm_type=2\n')
         f.write(f'flux_rescale_value={atoms_per_cc}\n')
         f.write('pka_filetype=2\n')
-        f.write('do_mtd_sums=.true.\n')
+        f.write('do_mtd_sums=.false.\n')
         f.write('do_ngamma_estimate=.t.\n')
         f.write('do_global_sums=.t.\n')
         f.write('do_exclude_light_from_total=.t.\n')

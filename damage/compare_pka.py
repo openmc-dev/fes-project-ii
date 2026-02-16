@@ -6,23 +6,140 @@ import argparse
 from math import pi
 
 import openmc
+from openmc.data import ATOMIC_NUMBER
 import matplotlib.pyplot as plt
 import numpy as np
 
+# Reverse map: atomic number -> element symbol
+_Z_TO_SYMBOL = {v: k for k, v in ATOMIC_NUMBER.items()}
 
-def run_openmc_simulation():
+
+def _parse_nuclide_name(nuc: str):
+    """Parse a nuclide string like 'Fe56' -> ('Fe', 56)."""
+    i = 0
+    while i < len(nuc) and not nuc[i].isdigit():
+        i += 1
+    symbol = nuc[:i]
+    mass_str = nuc[i:]
+    try:
+        A = int(mass_str)
+    except ValueError:
+        A = None
+    return symbol, A
+
+
+def _nuclide_z_a(nuc: str) -> tuple[int, int]:
+    """Return (Z, A) for a nuclide string like 'Fe56'."""
+    sym, A = _parse_nuclide_name(nuc)
+    return ATOMIC_NUMBER[sym], A
+
+
+def _nuclide_name(Z: int, A: int) -> str:
+    """Build a nuclide string like 'Fe56' from (Z, A)."""
+    return f"{_Z_TO_SYMBOL[Z]}{A}"
+
+
+# Each entry maps a reaction name to a list of (dZ, dA, light_particle)
+# deltas applied to the *compound* nucleus (Z, A+1).  The delta for the
+# residual (light=None) subtracts the total ejectile (Z, A).
+_REACTION_DELTAS: dict[str, list[tuple[int, int, str | None]]] = {
+    # (dZ, dA, light_particle_or_None)
+    #                          ejectile           residual = compound − ejectile(s)
+    '(n,elastic)':  [(0, -1, None)],           # n                → (Z, A)
+    '(n,gamma)':    [(0,  0, None)],           # γ                → (Z, A+1)
+    '(n,2n)':       [(0, -2, None)],           # 2n               → (Z, A−1)
+    '(n,3n)':       [(0, -3, None)],           # 3n               → (Z, A−2)
+    '(n,p)':        [(-1, -1, 'H1'),   (-1, -1, None)],   # p    → (Z−1, A)
+    '(n,d)':        [(-1, -2, 'H2'),   (-1, -2, None)],   # d    → (Z−1, A−1)
+    '(n,t)':        [(-1, -3, 'H3'),   (-1, -3, None)],   # t    → (Z−1, A−2)
+    '(n,3He)':      [(-2, -3, 'He3'),  (-2, -3, None)],   # ³He  → (Z−2, A−2)
+    '(n,a)':        [(-2, -4, 'He4'),  (-2, -4, None)],   # α    → (Z−2, A−3)
+    '(n,np)':       [(-1, -2, 'H1'),   (-1, -2, None)],   # n+p  → (Z−1, A−1)
+    '(n,na)':       [(-2, -5, 'He4'),  (-2, -5, None)],   # n+α  → (Z−2, A−4)
+    '(n,2p)':       [(-2, -2, 'H1'),   (-2, -2, None)],   # 2p   → (Z−2, A−1)
+    '(n,pa)':       [(-3, -5, 'H1'),   (-3, -5, 'He4'),  (-3, -5, None)],  # p+α → (Z−3, A−4)
+    '(n,2a)':       [(-4, -8, 'He4'),  (-4, -8, None)],   # 2α   → (Z−4, A−7)
+}
+
+
+def reaction_products(nuclide: str, reaction: str) -> list[str]:
+    """Return the list of product nuclides for *nuclide* + *reaction*.
+
+    Products include both the heavy residual and any light ejectiles
+    (H1, He4, etc.).  Duplicate names are removed while preserving order.
+
+    Discrete inelastic levels ``(n,n<N>)`` and continuum ``(n,nc)`` are
+    treated like elastic scattering (same residual as the target).
+
+    Examples
+    --------
+    >>> reaction_products('Fe56', '(n,elastic)')
+    ['Fe56']
+    >>> reaction_products('Fe56', '(n,2n)')
+    ['Fe55']
+    >>> reaction_products('W184', '(n,a)')
+    ['He4', 'Hf181']
+    >>> reaction_products('Fe56', '(n,n1)')
+    ['Fe56']
+    """
+    Z, A = _nuclide_z_a(nuclide)
+    compound_Z, compound_A = Z, A + 1  # compound nucleus after neutron absorption
+
+    # Map inelastic levels (n,n1), (n,n2), ..., (n,nc) to elastic-like
+    rx = reaction
+    if re.match(r'\(n,n\d+\)$', reaction) or reaction == '(n,nc)':
+        rx = '(n,elastic)'
+
+    if rx not in _REACTION_DELTAS:
+        raise ValueError(
+            f"Unknown reaction '{reaction}'. "
+            f"Supported: {sorted(_REACTION_DELTAS)}"
+        )
+
+    seen: set[str] = set()
+    products: list[str] = []
+    for dZ, dA, light in _REACTION_DELTAS[rx]:
+        if light is not None:
+            name = light
+        else:
+            name = _nuclide_name(compound_Z + dZ, compound_A + dA)
+        if name not in seen:
+            seen.add(name)
+            products.append(name)
+    return products
+
+
+def run_openmc_simulation(
+    nuclide: str = 'Fe56',
+    reactions: list[str] | None = None,
+    density_g_cc: float = 7.874,
+):
     """Run OpenMC simulation and extract neutron flux.
 
-    Extended to support multi-nuclide materials (e.g., natural Fe).
-    Returns the OpenMC model so we can query the nuclides present.
+    Parameters
+    ----------
+    nuclide : str
+        Target nuclide
+    reactions : list of str or None
+        Reaction channels to tally.
+    density_g_cc : float
+        Material density in g/cm³.
+
+    Returns
+    -------
+    flux, energies, mat
     """
-    print("Running OpenMC simulation...")
+    if reactions is None:
+        reactions = ['(n,elastic)', '(n,n1)', '(n,nc)', '(n,2n)', '(n,gamma)', '(n,p)', '(n,a)']
+
+    print(f"Running OpenMC simulation for {nuclide}...")
+    print(f"  Reactions: {reactions}")
 
     openmc.config['cross_sections'] = '/opt/data/hdf5/tendl-2019-hdf5/cross_sections.xml'
 
     mat = openmc.Material()
-    mat.add_nuclide('Fe56', 1.0)
-    mat.set_density('g/cm3', 7.874)
+    mat.add_nuclide(nuclide, 1.0)
+    mat.set_density('g/cm3', density_g_cc)
     R = 10.0
     mat.volume = 4/3 * pi * R**3
 
@@ -50,10 +167,20 @@ def run_openmc_simulation():
     tally.scores = ['flux']
     model.tallies.append(tally)
 
+    # Build ParticleProductionFilter from reaction products
+    products: list[str] = []
+    seen: set[str] = set()
+    for rx in reactions:
+        for p in reaction_products(nuclide, rx):
+            if p not in seen:
+                seen.add(p)
+                products.append(p)
+    print(f"  Products for ParticleProductionFilter: {products}")
+
     # Create tally for recoil distribution
     recoil_tally = openmc.Tally(name="recoil_distribution")
-    prod_filter = openmc.ParticleProductionFilter(['Fe55', 'Fe56'], 'CCFE-709')
-    reaction_filter = openmc.ReactionFilter(['(n,elastic)', '(n,n1)', '(n,nc)', '(n,2n)'])
+    prod_filter = openmc.ParticleProductionFilter(products, 'CCFE-709')
+    reaction_filter = openmc.ReactionFilter(reactions)
     recoil_tally.filters = [prod_filter, reaction_filter]
     recoil_tally.scores = ['events']
     model.tallies.append(recoil_tally)
@@ -101,20 +228,6 @@ def create_spectra_pka_flux_file(flux, energies, filename="openmc_flux.dat"):
 
     print(f"Flux file created with {num_groups} energy groups")
     return filename
-
-
-def _parse_nuclide_name(nuc: str):
-    """Parse a nuclide string like 'Fe56' -> ('Fe', 56)."""
-    i = 0
-    while i < len(nuc) and not nuc[i].isdigit():
-        i += 1
-    symbol = nuc[:i]
-    mass_str = nuc[i:]
-    try:
-        A = int(mass_str)
-    except ValueError:
-        A = None
-    return symbol, A
 
 
 def _pka_filepath_for_nuclide(nuc: str, base_dir: str) -> str:
